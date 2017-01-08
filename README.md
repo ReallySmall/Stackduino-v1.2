@@ -1,3 +1,3 @@
 Stackduino
 ==========
-Please visit the project site for details: https://www.stackduino.net
+Please visit the project site for details: https://www.stackduino.net/boards/v1_2

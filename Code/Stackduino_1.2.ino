@@ -73,15 +73,16 @@ char char_buffer[OLED_COLS + 1]; // make sure this is large enough for the large
 
 
 /* SET UP REMAINING ATMEGA PINS */
-const byte mcp_int = 2; // Incoming MCP23017 interrupts
+const byte btn_enc = 2; // Incoming MCP23017 interrupts
 const byte btn_main = 3;  // Main start/ stop stack button
 const byte step_dir = 4; // Direction pin on A4988 stepper driver
 const byte do_step = 5; // Step pin on A4988 stepper driver
 const byte cam_focus = 6; // Camera autofocus signal
 const byte cam_shutter = 7; // Camera shutter signal
-//const byte TO_DEFINE = 10;
-//const byte TO_DEFINE = A2;
-//const byte TO_DEFINE = 17;
+const byte stepper_enable = 8 // Enable/ disable the stepper driver
+
+const byte btn_fwd = A2; // Manual forward button
+const byte btn_bwd = A3; // Manual backward button
 
 
 

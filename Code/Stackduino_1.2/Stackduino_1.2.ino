@@ -10,7 +10,11 @@
 //  To support other fonts or screens, some recoding will be required                                   //
 ////////////////////////////////////////////////////////////////////////////////////////////////////////*/
 
-/* DEFINES AND DEPENDENCIES */
+/* YOUR HARDWARE SETTINGS */
+const float HARDWARE_CONSTANT = 2; // a number which on your system results in one step of the motor resulting in one micron of movement
+const byte MICRO_STEPS = 16; // the microstepping amount set on the stepper driver
+
+/* DEFINES AND DEPENDENCIES (you probably don't need to change these */
 #define _Digole_Serial_I2C_ // OLED screen configured with solder jumper to run in I2C mode
 #define OLED_ROWS 4 // OLED text rows
 #define OLED_COLS 16 // OLED text columns
@@ -49,21 +53,21 @@ char uom_chars[3] = {'u', 'm', 'c'};
 
 struct Settings { // A struct type for storing settings
 
-  int value; // The setting value
+  int value; // The current setting value
   byte lower; // The lowest value the setting may have
   int upper; // The highest value the setting may have
   byte multiplier; // Any multiplier to apply when the setting is incremented
 
 } settings[] = { // A struct of user menu settings
   {}, // The home screen - not actually used by any functions at the moment, but the placeholder array must exist to maintain the correct indexing
-  {10, 10, 500, 1}, // "Slice size"
-  {10, 10, 500, 10}, // "Number of slices"
+  {1, 1, 500, 1}, // "Slice size"
+  {5, 5, 500, 5}, // "Number of slices"
   {2, 0, 60, 1}, // "Pause time"
   {0, 0, 1, 1}, // "Mirror lockup"
   {1, 1, 10, 1}, // "Bracketing"
   {0, 0, 1, 1}, // "Return to start"
   {0, 0, 2, 1}, // "Unit of measure"
-  {1, 1, 8, 1} // "Stepper speed"
+  {7, 1, 20, 100} // "Stepper speed"
 };
 
 byte settings_count = sizeof(settings) / sizeof(Settings); // The number of settings
@@ -86,8 +90,6 @@ const byte btn_fwd = A3; // Manual backward button
 
 /* SETTINGS */
 const int uom_multipliers[] = {1, 1000, 10000}; // Multipliers for active unit of measure (mn, mm or cm)
-
-float active_hardware_calibration_setting = 2;
 
 boolean app_connected = false; // Whether a remote application is actively communicating with the controller
 boolean can_disable_stepper = true; // Whether to disable the A4988 stepper driver when possible to save power and heat
@@ -143,7 +145,7 @@ void setup() {
   pciSetup(ENC_A); // ATMega pin change interrupt
   pciSetup(ENC_B); // ATMega pin change interrupt
   
-  Wire.begin(); // join i2c bus (address optional for master)
+  Wire.begin(); // join i2c bus
   Serial.begin(9600); // Start serial (always initialise at 9600 for compatibility with OLED)
   
 }
@@ -215,6 +217,7 @@ void stepperDriverEnable(boolean enable = true, byte direction = 0, boolean togg
     
     digitalWrite(step_dir, !direction); // Set the direction
     previous_direction = direction; // Set the new direction for future toggle_direction calls
+    
   } 
 
 }
@@ -225,11 +228,11 @@ void stepperDriverEnable(boolean enable = true, byte direction = 0, boolean togg
 void stepperMoveOneSlice(byte direction = 1){
 
   byte slice_size = settings[1].value;
-  byte hardware = active_hardware_calibration_setting;
+  byte hardware = HARDWARE_CONSTANT; 
   byte unit_of_measure = uom_multipliers[settings[7].value];
-  byte micro_steps = 16;
+  byte micro_steps = MICRO_STEPS;
 
-  unsigned int rounded_steps = (slice_size * hardware * unit_of_measure * micro_steps) - 0.5;
+  unsigned int rounded_steps = ((slice_size * hardware * micro_steps) - 0.5) * unit_of_measure;
   
   stepperDriverEnable(true, direction, false); // Enable the stepper driver
 
@@ -253,13 +256,13 @@ void stepperDriverManualControl(byte direction = 1, boolean serial_control = fal
       unsigned long button_down = millis();
       char* manual_ctl_strings[2] = {"<", ">"};
       
-      if(digitalRead(btn_bwd) == LOW){
-        direction = 0;
-      }
+        if(digitalRead(btn_bwd) == LOW){
+          direction = 0;
+        }
       
-      if(digitalRead(btn_fwd) == LOW){
-        direction = 1;
-      }
+        if(digitalRead(btn_fwd) == LOW){
+          direction = 1;
+        }
       
       screenUpdate();
       screenPrint(sprintf_P(char_buffer, PSTR("Moving stage")), char_buffer, 2);
@@ -269,7 +272,7 @@ void stepperDriverManualControl(byte direction = 1, boolean serial_control = fal
       }
       
       // Move the stage for as long as the control button is pressed
-       while (stepperDriverInBounds() && Serial.available() == 0 && (digitalRead(btn_fwd) == LOW || digitalRead(btn_bwd) == LOW)) {
+      while (stepperDriverInBounds() && Serial.available() == 0 && (digitalRead(btn_fwd) == LOW || digitalRead(btn_bwd) == LOW)) {
          
           stepperDriverEnable(true, direction); // Enable the stepper driver and set the direction
           stepperDriverStep();
@@ -368,7 +371,7 @@ void shutter() {
       screenPrint(sprintf_P(char_buffer, PSTR("Mirror up")), char_buffer, 4);
     } else {
       screenPrint(sprintf_P(char_buffer, PSTR("Shutter")), char_buffer, 4);
-    }
+    }    
     
     pause(300);
 
@@ -729,14 +732,12 @@ void stackEnd() {
 
   if (settings[6].value == 1) { // If return stage to start position option is enabled
 
-    stepperDriverEnable(true, 0); // Enable the stepper driver and set the direction to backwards
-
     screenPrint(sprintf_P(char_buffer, PSTR("Returning")), char_buffer, 4);
     pause(1000);
 
-    for (int i; i < slice_count; i++) {
+    for (int i = 0; i < slice_count - 1; i++) {
 
-      stepperMoveOneSlice(1);
+      stepperMoveOneSlice(0);
 
     }
 
@@ -803,7 +804,7 @@ void stepperDriverStep() {
 
   digitalWrite(do_step, LOW); // This LOW to HIGH change is what creates the
   digitalWrite(do_step, HIGH); // "Rising Edge" so the driver knows when to step
-  delayMicroseconds(settings[8].value * 1000); // Delay time between steps, too short and motor may stall or miss steps
+  delayMicroseconds(settings[8].value * 100); // Delay time between steps, too short and motor may stall or miss steps
 
 }
 
@@ -900,7 +901,7 @@ void menuInteractions() {
       case 8: // Adjust the stepper motor speed (delay in microseconds between slice_size)
         // A smaller number gives faster motor speed but reduces torque
         // Setting this too low may cause the motor to miss steps or stall
-        string_length = sprintf_P(char_buffer, PSTR("%d000uS"), menu_var);
+        string_length = sprintf_P(char_buffer, PSTR("%d00uS"), menu_var);
         break;
 
     }

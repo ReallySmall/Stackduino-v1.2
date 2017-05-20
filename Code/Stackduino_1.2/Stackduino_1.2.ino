@@ -4,7 +4,7 @@
 //  https://github.com/ReallySmall/Stackduino-2                                                         //
 //                                                                                                      //
 //  An Arduino compatible Focus Stacking Controller                                                     //
-//  Richard Iles 2015                                                                                   //
+//  Richard Iles 2017                                                                                   //
 //                                                                                                      //
 //  Written for use with the Digole 128 x 64 OLED module using default font (4 rows of 16 chars)        //
 //  To support other fonts or screens, some recoding will be required                                   //
@@ -24,16 +24,16 @@
 #include "avr/pgmspace.h"
 
 
-
 /* CREATE REQUIRED OBJECTS */
 DigoleSerialDisp screen(&Wire, '\x27'); // Digole OLED in i2c mode
+
 
 typedef struct { // A struct type for storing char arrays
   char title [OLED_COLS + 1];
 } stringConstants;
 
 const stringConstants settings_titles[] PROGMEM = { // A struct of char arrays stored in Flash
-  {"Stackduino v2.2"},
+  {"Stackduino v1.2"},
   {"Slice size"},
   {"Slices"},
   {"Pause for"},
@@ -58,13 +58,12 @@ struct Settings { // A struct type for storing settings
   {}, // The home screen - not actually used by any functions at the moment, but the placeholder array must exist to maintain the correct indexing
   {10, 10, 500, 1}, // "Slice size"
   {10, 10, 500, 10}, // "Number of slices"
-  {5, 1, 60, 1}, // "Pause time"
+  {2, 0, 60, 1}, // "Pause time"
   {0, 0, 1, 1}, // "Mirror lockup"
   {1, 1, 10, 1}, // "Bracketing"
   {0, 0, 1, 1}, // "Return to start"
   {0, 0, 2, 1}, // "Unit of measure"
-  {2, 1, 8, 1}, // "Stepper speed"
-  {0, 0, 1, 1} // "Bluetooth"
+  {1, 1, 8, 1} // "Stepper speed"
 };
 
 byte settings_count = sizeof(settings) / sizeof(Settings); // The number of settings
@@ -73,29 +72,22 @@ char char_buffer[OLED_COLS + 1]; // make sure this is large enough for the large
 
 
 /* SET UP REMAINING ATMEGA PINS */
-const byte btn_enc = 2; // Incoming MCP23017 interrupts
-const byte btn_main = 3;  // Main start/ stop stack button
+const byte main_button = 3;  //start/ stop stack button
+const byte encoder_button = 2; //select/ unselect menu item button
 const byte step_dir = 4; // Direction pin on A4988 stepper driver
 const byte do_step = 5; // Step pin on A4988 stepper driver
 const byte cam_focus = 6; // Camera autofocus signal
 const byte cam_shutter = 7; // Camera shutter signal
-const byte stepper_enable = 8 // Enable/ disable the stepper driver
-
-const byte btn_fwd = A2; // Manual forward button
-const byte btn_bwd = A3; // Manual backward button
+const byte stepper_enable = 8; // Enable/ disable the stepper driver
+const byte btn_bwd = A2; // Manual forward button
+const byte btn_fwd = A3; // Manual backward button
 
 
 
 /* SETTINGS */
 const int uom_multipliers[] = {1, 1000, 10000}; // Multipliers for active unit of measure (mn, mm or cm)
 
-float active_hardware_calibration_setting;
-
-volatile boolean start_stack = false; // False when in the menu, true when stacking
-volatile boolean traverse_menus = true; // True when scrolling through menus, false when changing a menu item's value
-volatile byte btn_reading; // The current reading from the button
-volatile byte btn_previous = LOW; // The previous reading from the button
-volatile long btn_time = 0; // The last time the button was toggled
+float active_hardware_calibration_setting = 2;
 
 boolean app_connected = false; // Whether a remote application is actively communicating with the controller
 boolean can_disable_stepper = true; // Whether to disable the A4988 stepper driver when possible to save power and heat
@@ -108,6 +100,20 @@ int menu_item = 0; // The active menu item
 int increments = 0; // Count increments the active menu setting should be changed by on the next poll
 byte slice_count = 0; // Count of number of focus slices made so far in the stack
 
+//main button toggle
+volatile int main_button_state = LOW; //the current state of the output pin
+volatile int main_button_reading; //the current reading from the input pin
+volatile int main_button_previous = HIGH; //the previous reading from the input pin
+volatile long main_button_time = 0; //the last time the output pin was toggled
+volatile long main_button_debounce = 400; //the debounce time, increase if the output flickers
+
+//rotary pushButton toggle
+volatile int rotary_button_state = HIGH; //the current state of the output pin
+volatile int rbreading; //the current reading from the input pin
+volatile int rbprevious = LOW; //the previous reading from the input pin
+volatile long rbtime = 0; //the last time the output pin was toggled
+volatile long rbdebounce = 400; //the debounce time, increase if the output flickers
+
 unsigned long time_stack_started;
 
 char* app_conn_icon = "";
@@ -118,24 +124,28 @@ char* app_conn_icon = "";
 void setup() {
 
   /* SET ATMEGA PINMODES AND PULLUPS */
-  pinMode(mcp_int, INPUT); digitalWrite(mcp_int, HIGH);
-  pinMode(btn_main, INPUT); digitalWrite(btn_main, HIGH);
+  pinMode(encoder_button, INPUT); digitalWrite(encoder_button, HIGH);
+  pinMode(main_button, INPUT); digitalWrite(main_button, HIGH);
   pinMode(ENC_A, INPUT); digitalWrite(ENC_A, HIGH);
   pinMode(ENC_B, INPUT); digitalWrite(ENC_B, HIGH);
-  pinMode(step_dir, OUTPUT); digitalWrite(step_dir, LOW);
+  
+  pinMode(step_dir, OUTPUT); digitalWrite(step_dir, HIGH);
   pinMode(do_step, OUTPUT); digitalWrite(do_step, LOW);
   pinMode(cam_focus, OUTPUT); digitalWrite(cam_focus, LOW);
   pinMode(cam_shutter, OUTPUT); digitalWrite(cam_shutter, LOW);
+  pinMode(btn_fwd, OUTPUT); digitalWrite(btn_fwd, HIGH);
+  pinMode(btn_bwd, OUTPUT); digitalWrite(btn_bwd, HIGH);  
 
   /* SET UP INTERRUPTS */
-  //attachInterrupt(0, mcpInterrupt, FALLING); // ATMega external interrupt 0
-  attachInterrupt(1, cancelStack, FALLING); // ATMega external interrupt 1
+  attachInterrupt(1, button_main_change, CHANGE);  //main button on interrupt 1
+  attachInterrupt(0, button_rotary_change, CHANGE);  //encoder button on interrupt 0
 
   pciSetup(ENC_A); // ATMega pin change interrupt
   pciSetup(ENC_B); // ATMega pin change interrupt
   
-  /* FINAL PRE-START CHECKS AND SETUP */
+  Wire.begin(); // join i2c bus (address optional for master)
   Serial.begin(9600); // Start serial (always initialise at 9600 for compatibility with OLED)
+  
 }
 
 
@@ -154,8 +164,6 @@ void setup() {
 void screenUpdate() { /* WIPE THE SCREEN, PRINT THE HEADER AND SET THE CURSOR POSITION */
 
   screen.clearScreen(); // Repaints the screen blank
-  screenPrintBluetooth(); // Display an icon for current bluetooth connection state
-
   screen.drawBox(1, 17, 128, 1); // Draw a horizontal line to mark out the header section
   screen.setPrintPos(0, 2); // Set text position to beginning of content area
 
@@ -193,11 +201,11 @@ void screenPrint(byte char_length, char* text, byte print_pos_y = 4) {
 /* ENABLE OR DISABLE THE STEPPER DRIVER AND SET DIRECTION
 *
 * enable => Enables the stepper driver if true, Disables if false and option set
-* direction => Set as 1 for forward direction, 0 for backward direction
+* direction => Set as 0 for forward direction, 1 for backward direction
 * toggle_direction => Toggle the direction to be the opposite of its current state
 *
 */
-void stepperDriverEnable(boolean enable = true, byte direction = 1, boolean toggle_direction = false) {
+void stepperDriverEnable(boolean enable = true, byte direction = 0, boolean toggle_direction = false) {
 
   if (enable) {
     
@@ -205,7 +213,7 @@ void stepperDriverEnable(boolean enable = true, byte direction = 1, boolean togg
       direction = previous_direction;
     }
     
-    digitalWrite(step_dir, direction); // Set the direction
+    digitalWrite(step_dir, !direction); // Set the direction
     previous_direction = direction; // Set the new direction for future toggle_direction calls
   } 
 
@@ -240,10 +248,18 @@ void stepperMoveOneSlice(byte direction = 1){
 /* MOVE STAGE BACKWARD AND FORWARD */
 void stepperDriverManualControl(byte direction = 1, boolean serial_control = false, boolean short_press = false) {
 
-    //if ((mcp.digitalRead(0) == LOW || mcp.digitalRead(1) == LOW || serial_control == true) && stepperDriverInBounds()) {
+    if ((digitalRead(btn_fwd) == LOW || digitalRead(btn_bwd) == LOW || serial_control == true) && stepperDriverInBounds()) {
       
       unsigned long button_down = millis();
       char* manual_ctl_strings[2] = {"<", ">"};
+      
+      if(digitalRead(btn_bwd) == LOW){
+        direction = 0;
+      }
+      
+      if(digitalRead(btn_fwd) == LOW){
+        direction = 1;
+      }
       
       screenUpdate();
       screenPrint(sprintf_P(char_buffer, PSTR("Moving stage")), char_buffer, 2);
@@ -251,22 +267,20 @@ void stepperDriverManualControl(byte direction = 1, boolean serial_control = fal
       for (byte i = 0; i < 8; i++) {
         screen.print(manual_ctl_strings[direction]);
       }
-
-      stepperDriverEnable(true, direction); // Enable the stepper driver and set the direction
       
-      if(short_press){ // Move the stage by one focus slice - useful for adding extra slices to the front and end of a stack
-        stepperMoveOneSlice(1);
-      } else { // Move the stage for as long as the control button is pressed
-        //while ((mcp.digitalRead(direction) == LOW || serial_control == true) && stepperDriverInBounds() && Serial.available() == 0) {
+      // Move the stage for as long as the control button is pressed
+       while (stepperDriverInBounds() && Serial.available() == 0 && (digitalRead(btn_fwd) == LOW || digitalRead(btn_bwd) == LOW)) {
+         
+          stepperDriverEnable(true, direction); // Enable the stepper driver and set the direction
           stepperDriverStep();
           if (!stepperDriverInBounds()) stepperDriverClearLimitSwitch();
-        //}
-      }
-
-    //}
+          
+       }
 
     stepperDriverEnable(false); // Disable the stepper driver
     update_display = true; // Go back to displaying the active menu item once manual control button is no longer pressed
+    
+    }
 
 }
 
@@ -316,7 +330,7 @@ void captureImages() {
       screenPrint(sprintf_P(char_buffer, PSTR("Bracket %d/%d"), i, settings[5].value), char_buffer, 4);
     }
     
-    pause(1500); // Allow vibrations to settle
+    pause(500); // Allow vibrations to settle
     shutter(); // Take the image
     
     for (byte i = 0; i < settings[3].value; i++) { // Count down the pause for camera on the screen
@@ -356,7 +370,7 @@ void shutter() {
       screenPrint(sprintf_P(char_buffer, PSTR("Shutter")), char_buffer, 4);
     }
     
-    pause(500);
+    pause(300);
 
     digitalWrite(cam_focus, HIGH); // Trigger camera autofocus - camera may not take picture in some modes if this is not triggered first
     digitalWrite(cam_shutter, HIGH); // Trigger camera shutter
@@ -374,50 +388,48 @@ void shutter() {
 
 
 
-/* BUTTON PRESSES
-*
-* Debounces button presses and distinguishes between short and long presses
-*
-*/
-void btnPress(byte btn_pin) {
+/*////////////////////////////////////////////////////////////////////////////////////////////////////////
+//  BUTTON FUNCTIONS                                                                                    //       
+////////////////////////////////////////////////////////////////////////////////////////////////////////*/ 
 
-  //btn_reading = btn_pin == 3 ? digitalRead(btn_pin) : mcp.digitalRead(btn_pin);
-  
+void button_main_change(){ /* RETURN CURRENT STATE OF MAIN PUSH BUTTON */
 
-  if ((btn_reading == LOW) && (btn_previous == HIGH) && (millis() - btn_time > 50)) {
-    
-    boolean short_press = false;
-    unsigned long btn_down_time = millis();
-    
-    while(millis() < btn_down_time + 300){ // Press and hold to start a stack
-      //if(btn_pin == 3 ? digitalRead(btn_pin) : mcp.digitalRead(btn_pin) == HIGH){ // Press and immedeately release to take test images
-        short_press = true;
-        break; 
-      //} 
-    }
-        
-    btn_time = millis();  
-  
-    switch(btn_pin){
-      case 0: case 1:
-        short_press == true ? stepperMoveOneSlice(btn_pin) : stepperDriverManualControl(btn_pin);
-        break;
-      case 3:
-        short_press == true ? captureImages() : startStack();
-        break;
-      case 10:
-        short_press == true ? menuNav() : menuNav();
-    }
-        
+  main_button_reading = digitalRead(main_button);
+
+  if (main_button_reading == LOW && main_button_previous == HIGH && millis() - main_button_time > main_button_debounce) {
+    if (main_button_state == HIGH)
+    main_button_state = LOW;
+    else
+    main_button_state = HIGH;
+
+    main_button_time = millis();    
   }
 
-  btn_previous = btn_reading;
+  main_button_previous = main_button_reading;
+} 
+
+void button_rotary_change(){/* RETURN CURRENT STATE OF ROTARY ENCODER'S PUSH BUTTON */
+
+  rbreading = digitalRead(encoder_button);
+  if (rbreading == LOW && rbprevious == HIGH && millis() - rbtime > rbdebounce) {
+    if (rotary_button_state == HIGH && menu_item != 0)
+      rotary_button_state = LOW;
+    else
+      rotary_button_state = HIGH;
+      rbtime = millis();    
+  }
+
+  update_display = true;
+  rbprevious = rbreading;
 
 }
 
+
+
+
 void startStack() {
 
-  start_stack = start_stack == true ? false : true;
+  main_button_state = main_button_state == HIGH ? LOW : HIGH;
 
 }
 
@@ -426,8 +438,8 @@ void startStack() {
 // So there's no debouncing or toggling of state
 void cancelStack(){
   
-  if(start_stack){
-    start_stack = false; 
+  if(main_button_state){
+    main_button_state = LOW; 
   }
   
 }
@@ -435,7 +447,7 @@ void cancelStack(){
 void menuNav() {
 
   if (menu_item != 0) {
-    traverse_menus = traverse_menus == true ? false : true;
+    rotary_button_state = rotary_button_state == true ? false : true;
   }
 
   update_display = true;
@@ -530,8 +542,8 @@ void pause(unsigned int length) {
 */
 void screenPrintMenuArrows() {
 
-  if (!start_stack) {
-    if (traverse_menus) { // Move to the next menu item
+  if (!main_button_state) {
+    if (rotary_button_state) { // Move to the next menu item
       //TODO: CREATE ICON FOR FONT FILE TO REPLACE BELOW
       screen.drawBox(5, 52, 1, 9); // Left outward arrow
       screen.drawBox(4, 53, 1, 7);
@@ -559,36 +571,6 @@ void screenPrintMenuArrows() {
       screen.drawBox(126, 52, 1, 9);
     }
   }
-}
-
-
-
-/* PRINT BLUETOOTH ICON ON DIGOLE OLED SCREEN
-*
-* Assumes the default font is in use (allowing 4 rows of 16 characters)
-*
-*/
-void screenPrintBluetooth() {
-
-  if (settings[10].value) { //if the bluetooth header (H_1) is active
-    screen.drawBox(1, 2, 1, 1);
-    screen.drawBox(1, 8, 1, 1);
-    screen.drawBox(2, 3, 1, 1);
-    screen.drawBox(2, 7, 1, 1);
-    screen.drawBox(3, 4, 1, 1);
-    screen.drawBox(3, 6, 1, 1);
-    screen.drawBox(4, 1, 1, 9);
-    screen.drawBox(5, 1, 1, 1);
-    screen.drawBox(5, 5, 1, 1);
-    screen.drawBox(5, 9, 1, 1);
-    screen.drawBox(6, 2, 1, 1);
-    screen.drawBox(6, 4, 1, 1);
-    screen.drawBox(6, 6, 1, 1);
-    screen.drawBox(6, 8, 1, 1);
-    screen.drawBox(7, 3, 1, 1);
-    screen.drawBox(7, 7, 1, 1);
-  }
-
 }
 
 
@@ -712,11 +694,11 @@ boolean stackCancelled() {
       if(serial_in == 'a') startStack(); // Stop stack
     }
     
-    if (!start_stack && time_stack_started && (millis() > time_stack_started + 2000)) {
+    if (!main_button_state && time_stack_started && (millis() > time_stack_started + 2000)) {
       return true; // Stack is cancelled if has been running for over 2 seconds (debouncing interrupt without using a delay)
     }
   
-    start_stack = true;
+    main_button_state = HIGH;
   }
   
   return false;
@@ -734,7 +716,7 @@ boolean stackCancelled() {
 void stackEnd() {
 
   screenUpdate();
-  screenPrint(sprintf_P(char_buffer, start_stack == false ? PSTR("Stack cancelled") : PSTR("Stack completed")), char_buffer, 2);
+  screenPrint(sprintf_P(char_buffer, main_button_state == LOW ? PSTR("Stack cancelled") : PSTR("Stack completed")), char_buffer, 2);
   
   // Calculate how many minutes and seconds the stack ran for before it completed or was cancelled
   unsigned int seconds = (millis() - time_stack_started) / 1000; // Number of seconds since stack was started
@@ -766,7 +748,7 @@ void stackEnd() {
   menu_item = 0; // Set menu to first option screen
   home_screen = true; // Reinstate the home screen
   slice_count = 0; // Reset pic counter
-  start_stack = false; // Return to menu options section
+  main_button_state = LOW; // Return to menu options section
   update_display = true; // Write the first menu item to the screen
 
 }
@@ -794,8 +776,8 @@ void stepperDriverClearLimitSwitch() {
   update_display = true;
   stepperDriverEnable(false); // Disable the stepper driver
 
-  if (start_stack) { // If a stack was in progress, cancel it
-    start_stack = false;
+  if (main_button_state) { // If a stack was in progress, cancel it
+    main_button_state = LOW;
     stackCancelled();
   }
 
@@ -810,7 +792,7 @@ boolean stepperDriverInBounds() {
     //return true;
   //}
 
-  return false;
+  return true;
 
 }
 
@@ -862,7 +844,7 @@ void menuInteractions() {
 
   int lower_limit = home_screen == true ? 0 : 1; // The home screen is only appears once when the menu is first loaded, it's skipped when looping around the options
 
-  if (traverse_menus) { // Move through menu items
+  if (rotary_button_state) { // Move through menu items
     settingUpdate(menu_item, lower_limit - 1, settings_count); // Display the currently selected menu item
     if (menu_item == settings_count) menu_item = lower_limit; // Create looping navigation
     if (menu_item == lower_limit - 1) menu_item = settings_count - 1; // Create looping navigation
@@ -928,7 +910,7 @@ void menuInteractions() {
     
     screenPrint(strlen(flashString.title), flashString.title, 2); // Print the menu setting title
 
-    if (!traverse_menus) { // Invert the colour of the current menu item to indicate it is editable
+    if (!rotary_button_state) { // Invert the colour of the current menu item to indicate it is editable
       byte boxWidth = (string_length * 8) + 2;
       byte leftPos = ((128 - boxWidth) / 2);
       screen.setMode('~');
@@ -960,14 +942,11 @@ void loop() {
   * Menu navigation controlled either by rotary encoder with integral push button, or via serial
   *
   */
-  if (!start_stack) { // User settings menus and manual stage control
+  if (main_button_state == LOW) { // User settings menus and manual stage control
 
-    btnPress(3);
-    btnPress(10);
-    btnPress(0);
-    btnPress(1);
     serialCommunications();  // Check for commands via serial
     menuInteractions(); // Change menu options and update the screen when changed
+    stepperDriverManualControl();
 
   }
 

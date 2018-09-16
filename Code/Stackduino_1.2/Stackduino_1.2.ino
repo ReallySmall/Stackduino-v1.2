@@ -11,7 +11,7 @@
 ////////////////////////////////////////////////////////////////////////////////////////////////////////*/
 
 /* YOUR HARDWARE SETTINGS */
-const float HARDWARE_CONSTANT = 2; // a number which on your system results in one step of the motor resulting in one micron of movement
+const float HARDWARE_CONSTANT = 0.2; // a number which on your system results in one step of the motor resulting in one micron of movement
 const byte MICRO_STEPS = 16; // the microstepping amount set on the stepper driver
 
 /* DEFINES AND DEPENDENCIES (you probably don't need to change these */
@@ -24,7 +24,8 @@ const byte MICRO_STEPS = 16; // the microstepping amount set on the stepper driv
 #define settings_elements 4 // Number of properties in each settings
 
 #include "DigoleSerial.h" // https://github.com/chouckz/HVACX10Arduino/blob/master/1.0.1_libraries/DigoleSerial/DigoleSerial.h
-#include "Wire.h" //
+#include <Wire.h> //
+#include <EEPROM.h>
 #include "avr/pgmspace.h"
 
 
@@ -51,26 +52,37 @@ const stringConstants settings_titles[] PROGMEM = { // A struct of char arrays s
 
 char uom_chars[3] = {'u', 'm', 'c'};
 
-struct Settings { // A struct type for storing settings
+struct SettingsDesc { // A struct type for storing settings
 
-  int value; // The current setting value
   byte lower; // The lowest value the setting may have
   int upper; // The highest value the setting may have
   byte multiplier; // Any multiplier to apply when the setting is incremented
 
-} settings[] = { // A struct of user menu settings
+} settingsDesc[] = { // A struct of user menu settings
   {}, // The home screen - not actually used by any functions at the moment, but the placeholder array must exist to maintain the correct indexing
-  {1, 1, 500, 1}, // "Slice size"
-  {5, 5, 500, 5}, // "Number of slices"
-  {2, 0, 60, 1}, // "Pause time"
-  {0, 0, 1, 1}, // "Mirror lockup"
-  {1, 1, 10, 1}, // "Bracketing"
-  {0, 0, 1, 1}, // "Return to start"
-  {0, 0, 2, 1}, // "Unit of measure"
-  {7, 1, 20, 100} // "Stepper speed"
+  {1, 500, 1}, // "Slice size"
+  {5, 500, 5}, // "Number of slices"
+  {0, 60, 1}, // "Pause time"
+  {0, 1, 1}, // "Mirror lockup"
+  {1, 10, 1}, // "Bracketing"
+  {0, 1, 1}, // "Return to start"
+  {0, 2, 1}, // "Unit of measure"
+  {5, 20, 1} // "Stepper speed"
 };
 
-byte settings_count = sizeof(settings) / sizeof(Settings); // The number of settings
+int settingsValue[] = {
+  0,
+  1,
+  5,
+  2,
+  0,
+  1,
+  0,
+  0,
+  1
+};
+
+byte settings_count = sizeof(settingsDesc) / sizeof(SettingsDesc); // The number of settings
 char char_buffer[OLED_COLS + 1]; // make sure this is large enough for the largest string it must hold
 
 
@@ -85,7 +97,7 @@ const byte cam_shutter = 7; // Camera shutter signal
 const byte stepper_enable = 8; // Enable/ disable the stepper driver
 const byte btn_bwd = A2; // Manual forward button
 const byte btn_fwd = A3; // Manual backward button
-
+const byte limit_switch = 9;
 
 
 /* SETTINGS */
@@ -120,6 +132,22 @@ unsigned long time_stack_started;
 
 char* app_conn_icon = "";
 
+volatile byte btn_reading; // The current reading from the button
+volatile byte btn_previous = LOW; // The previous reading from the button
+volatile long btn_time = 0; // The last time the button was toggled
+
+
+void loadSettings(){
+  byte value = EEPROM.read(0);  
+  if (value != 2) return;
+
+  EEPROM.get(1, settingsValue);
+}
+
+void saveSettings(){
+  EEPROM.put(1, settingsValue);
+  EEPROM.update(0, 2);
+}
 
 
 /* SETUP() */
@@ -130,6 +158,7 @@ void setup() {
   pinMode(main_button, INPUT); digitalWrite(main_button, HIGH);
   pinMode(ENC_A, INPUT); digitalWrite(ENC_A, HIGH);
   pinMode(ENC_B, INPUT); digitalWrite(ENC_B, HIGH);
+  pinMode(limit_switch, INPUT); digitalWrite(limit_switch, HIGH);
   
   pinMode(step_dir, OUTPUT); digitalWrite(step_dir, HIGH);
   pinMode(do_step, OUTPUT); digitalWrite(do_step, LOW);
@@ -147,7 +176,8 @@ void setup() {
   
   Wire.begin(); // join i2c bus
   Serial.begin(9600); // Start serial (always initialise at 9600 for compatibility with OLED)
-  
+
+  loadSettings();
 }
 
 
@@ -210,15 +240,20 @@ void screenPrint(byte char_length, char* text, byte print_pos_y = 4) {
 void stepperDriverEnable(boolean enable = true, byte direction = 0, boolean toggle_direction = false) {
 
   if (enable) {
+    digitalWrite(stepper_enable, LOW); // Enable the stepper driver
     
     if (toggle_direction) { // Toggle the direction to set (used by limit switches)
-      direction = previous_direction;
+      direction = !previous_direction;
     }
     
     digitalWrite(step_dir, !direction); // Set the direction
     previous_direction = direction; // Set the new direction for future toggle_direction calls
     
-  } 
+  }
+  else {
+    digitalWrite(stepper_enable, HIGH); // Disable the stepper driver
+  }
+  
 
 }
 
@@ -227,12 +262,14 @@ void stepperDriverEnable(boolean enable = true, byte direction = 0, boolean togg
 /* MOVE STAGE FORWARD BY ONE SLICE */
 void stepperMoveOneSlice(byte direction = 1){
 
-  byte slice_size = settings[1].value;
-  byte hardware = HARDWARE_CONSTANT; 
-  byte unit_of_measure = uom_multipliers[settings[7].value];
+  int slice_size = settingsValue[1];
+  float hardware = HARDWARE_CONSTANT; 
+  int unit_of_measure = uom_multipliers[settingsValue[7]];
   byte micro_steps = MICRO_STEPS;
 
-  unsigned int rounded_steps = ((slice_size * hardware * micro_steps) - 0.5) * unit_of_measure;
+  unsigned int rounded_steps = (slice_size * hardware * micro_steps * unit_of_measure) + 0.5;
+  Serial.println(rounded_steps);
+  Serial.println(direction);
   
   stepperDriverEnable(true, direction, false); // Enable the stepper driver
 
@@ -255,26 +292,20 @@ void stepperDriverManualControl(byte direction = 1, boolean serial_control = fal
       
       unsigned long button_down = millis();
       char* manual_ctl_strings[2] = {"<", ">"};
-      
-        if(digitalRead(btn_bwd) == LOW){
-          direction = 0;
-        }
-      
-        if(digitalRead(btn_fwd) == LOW){
-          direction = 1;
-        }
-      
+          
       screenUpdate();
       screenPrint(sprintf_P(char_buffer, PSTR("Moving stage")), char_buffer, 2);
       screen.setPrintPos(4, 4);
       for (byte i = 0; i < 8; i++) {
         screen.print(manual_ctl_strings[direction]);
       }
+
+      stepperDriverEnable(true, direction); // Enable the stepper driver and set the direction
       
       // Move the stage for as long as the control button is pressed
       while (stepperDriverInBounds() && Serial.available() == 0 && (digitalRead(btn_fwd) == LOW || digitalRead(btn_bwd) == LOW)) {
          
-          stepperDriverEnable(true, direction); // Enable the stepper driver and set the direction
+          
           stepperDriverStep();
           if (!stepperDriverInBounds()) stepperDriverClearLimitSwitch();
           
@@ -322,29 +353,29 @@ void appConnection() {
 *
 */
 void captureImages() {
-  
+
   screenUpdate();
 
-  for (byte i = 1; i <= settings[5].value; i++) { // Number of brackets to take per focus slice
+  for (byte i = 1; i <= settingsValue[5]; i++) { // Number of brackets to take per focus slice
 
     screenPrintPositionInStack();
 
-    if (settings[5].value > 1) { // If more than one image is being taken, display the current position in the bracket
-      screenPrint(sprintf_P(char_buffer, PSTR("Bracket %d/%d"), i, settings[5].value), char_buffer, 4);
+    if (settingsValue[5] > 1) { // If more than one image is being taken, display the current position in the bracket
+      screenPrint(sprintf_P(char_buffer, PSTR("Bracket %d/%d"), i, settingsValue[5]), char_buffer, 4);
     }
     
-    pause(500); // Allow vibrations to settle
-    shutter(); // Take the image
-    
-    for (byte i = 0; i < settings[3].value; i++) { // Count down the pause for camera on the screen
+    for (byte i = 0; i < settingsValue[3]; i++) { // Count down the pause for camera on the screen
 
       screenPrintPositionInStack();
-      screenPrint(sprintf_P(char_buffer, PSTR("Resume in %ds"), settings[3].value - i), char_buffer, 4);
+      screenPrint(sprintf_P(char_buffer, PSTR("Resume in %ds"), settingsValue[3] - i), char_buffer, 4);
       pause(1000);
       
       if (stackCancelled()) break; // Exit early if the stack has been cancelled
 
     }
+
+    shutter(); // Take the image
+    pause(1000); // Wait for capture
 
     if (stackCancelled()) break; // Exit early if the stack has been cancelled
 
@@ -363,11 +394,11 @@ void captureImages() {
 */
 void shutter() {
 
-  for (byte i = 0; i <= settings[4].value; i++) {
+  for (byte i = 0; i <= settingsValue[4]; i++) {
 
     screenPrintPositionInStack();
     
-    if (settings[4].value && i == 0) { // If mirror lockup enabled
+    if (settingsValue[4] && i == 0) { // If mirror lockup enabled
       screenPrint(sprintf_P(char_buffer, PSTR("Mirror up")), char_buffer, 4);
     } else {
       screenPrint(sprintf_P(char_buffer, PSTR("Shutter")), char_buffer, 4);
@@ -383,7 +414,7 @@ void shutter() {
     digitalWrite(cam_shutter, LOW); // Switch off camera trigger signal
     digitalWrite(cam_focus, LOW); // Switch off camera focus signal
 
-    if (settings[4].value && i == 0) { // If mirror lockup enabled
+    if (settingsValue[4] && i == 0) { // If mirror lockup enabled
       pause(2000); // Pause between mirror up and shutter actuation
     }
   }
@@ -600,7 +631,7 @@ void screenPrintPositionInStack() {
 
   screenUpdate();
   if(slice_count > 0){ // Default behaviour in a running stack
-    screenPrint(sprintf_P(char_buffer, PSTR("Slice %d/%d"), slice_count, settings[2].value), char_buffer, 2);
+    screenPrint(sprintf_P(char_buffer, PSTR("Slice %d/%d"), slice_count, settingsValue[2]), char_buffer, 2);
   } else { // If called by a function when in setup
     screenPrint(sprintf_P(char_buffer, PSTR("Single slice")), char_buffer, 2);
   }
@@ -620,6 +651,7 @@ void serialCommunications() {
   if (Serial.available() > 0) {
 
     int serial_in = Serial.read(); // read the incoming byte:
+    Serial.write("accepted\n");
 
     switch (serial_in) {
 
@@ -664,12 +696,12 @@ void serialCommunications() {
         break;
 
       case 'k': // Switch Bluetooth on or off
-        settings[10].value = settings[10].value == 1 ? 0 : 1;
+        settingsValue[10] = settingsValue[10] == 1 ? 0 : 1;
         update_display = true;
         break;
 
       case 'l':
-        //saveSettings();
+        saveSettings();
         break;
 
       case 'm': // Switch off controller
@@ -730,7 +762,7 @@ void stackEnd() {
 
   delay(3000);
 
-  if (settings[6].value == 1) { // If return stage to start position option is enabled
+  if (settingsValue[6] == 1) { // If return stage to start position option is enabled
 
     screenPrint(sprintf_P(char_buffer, PSTR("Returning")), char_buffer, 4);
     pause(1000);
@@ -766,11 +798,10 @@ void stepperDriverClearLimitSwitch() {
 
   stepperDriverEnable(true, 0, true); // Enable the stepper driver and toggle the direction
 
-  //while (mcp.digitalRead(limit_switch_front) == LOW || mcp.digitalRead(limit_switch_back) == LOW) { //turn stepper motor for as long as  the limit switch remains pressed
-
-    //stepperDriverStep();
-
-  //}
+  while (digitalRead(limit_switch) == LOW) { //turn stepper motor for as long as  the limit switch remains pressed
+    delayMicroseconds(100);
+    stepperDriverStep();
+  }
 
   stepperDriverEnable(true, 0, true); // Enable stepper driver and toggle the direction
 
@@ -789,11 +820,11 @@ void stepperDriverClearLimitSwitch() {
 /* CHECK IF STAGE IS IN BOUNDS OF TRAVEL I.E. NEITHER LIMIT SWITCH IS TRIPPED */
 boolean stepperDriverInBounds() {
 
-  //if (mcp.digitalRead(limit_switch_front) == HIGH && mcp.digitalRead(limit_switch_back) == HIGH) {
-    //return true;
-  //}
+  if (digitalRead(limit_switch) == HIGH) {
+    return true;
+  }
 
-  return true;
+  return false;
 
 }
 
@@ -804,7 +835,7 @@ void stepperDriverStep() {
 
   digitalWrite(do_step, LOW); // This LOW to HIGH change is what creates the
   digitalWrite(do_step, HIGH); // "Rising Edge" so the driver knows when to step
-  delayMicroseconds(settings[8].value * 100); // Delay time between steps, too short and motor may stall or miss steps
+  delayMicroseconds(settingsValue[8] * 10); // Delay time between steps, too short and motor may stall or miss steps
 
 }
 
@@ -850,16 +881,16 @@ void menuInteractions() {
     if (menu_item == settings_count) menu_item = lower_limit; // Create looping navigation
     if (menu_item == lower_limit - 1) menu_item = settings_count - 1; // Create looping navigation
   } else { // Otherwise change the value of the current menu item
-    settingUpdate(settings[menu_item].value, settings[menu_item].lower - 1, settings[menu_item].upper + 1, settings[menu_item].multiplier);
-    if (settings[menu_item].value > settings[menu_item].upper) settings[menu_item].value = settings[menu_item].lower; // Create looping navigation
-    if (settings[menu_item].value < settings[menu_item].lower) settings[menu_item].value = settings[menu_item].upper; // Create looping navigation
+    settingUpdate(settingsValue[menu_item], settingsDesc[menu_item].lower - 1, settingsDesc[menu_item].upper + 1, settingsDesc[menu_item].multiplier);
+    if (settingsValue[menu_item] > settingsDesc[menu_item].upper) settingsValue[menu_item] = settingsDesc[menu_item].lower; // Create looping navigation
+    if (settingsValue[menu_item] < settingsDesc[menu_item].lower) settingsValue[menu_item] = settingsDesc[menu_item].upper; // Create looping navigation
   }
 
   if (menu_item != 0) home_screen = false; // Remove homescreen from the menu loop once navigation begun
 
   if (update_display) { // Refresh menu content if the active variable has changed
 
-    int menu_var = settings[menu_item].value; // The value of the active menu item
+    int menu_var = settingsValue[menu_item]; // The value of the active menu item
     byte string_length; // The length of the formatted string describing the current menu item
     screenUpdate(); // Update the screen
     screenPrintMenuArrows(); // Print menu arrows
@@ -901,7 +932,7 @@ void menuInteractions() {
       case 8: // Adjust the stepper motor speed (delay in microseconds between slice_size)
         // A smaller number gives faster motor speed but reduces torque
         // Setting this too low may cause the motor to miss steps or stall
-        string_length = sprintf_P(char_buffer, PSTR("%d00uS"), menu_var);
+        string_length = sprintf_P(char_buffer, PSTR("%d0uS"), menu_var);
         break;
 
     }
@@ -926,13 +957,47 @@ void menuInteractions() {
 
 }
 
+void btnPress(byte btn_pin) {
+
+  btn_reading = digitalRead(btn_pin);
+  
+  if ((btn_reading == LOW) && (btn_previous == HIGH) && (millis() - btn_time > 150)) {
+    
+    boolean short_press = false;
+    unsigned long btn_down_time = millis();
+
+    //if (btn_pin == main_button){
+    //  while(millis() < btn_down_time + 500){ // Press and hold to start a stack
+    //    if(digitalRead(btn_pin) == HIGH){ // Press and immedeately release to take test images
+    //      short_press = true;
+    //      break; 
+    //    } 
+    //  }
+    //}
+        
+    btn_time = millis();  
+  
+    switch(btn_pin){
+      case btn_fwd: 
+      case btn_bwd:
+        stepperDriverManualControl(btn_pin == btn_fwd ? 1 : 0);
+        break;
+      case main_button:
+        short_press == true ? captureImages() : startStack();
+        break;
+    }
+        
+  }
+
+  btn_previous = btn_reading;
+
+}
 
 
 /*////////////////////////////////////////////////////////////////////////////////////////////////////////
 //  MAIN LOOP                                                                                           //
 ////////////////////////////////////////////////////////////////////////////////////////////////////////*/
 void loop() {
-
 
 
   /* MENUS AND STAGE CONTROL
@@ -945,10 +1010,11 @@ void loop() {
   */
   if (main_button_state == LOW) { // User settings menus and manual stage control
 
+    btnPress(main_button);
+    btnPress(btn_fwd);
+    btnPress(btn_bwd);
     serialCommunications();  // Check for commands via serial
     menuInteractions(); // Change menu options and update the screen when changed
-    stepperDriverManualControl();
-
   }
 
 
@@ -960,8 +1026,10 @@ void loop() {
   */
   else {
 
-    byte slice_size = settings[1].value;
-    byte slices = settings[2].value;
+    byte slice_size = settingsValue[1];
+    byte slices = settingsValue[2];
+
+    saveSettings();
     
     time_stack_started = millis();
 
@@ -977,7 +1045,7 @@ void loop() {
 
       screenPrintPositionInStack(); // Print the current position in the stack
       // Print that the stage is being advanced by x units
-      screenPrint(sprintf_P(char_buffer, PSTR("Advance %d%c%c"), slice_size, uom_chars[settings[7].value], uom_chars[1]), char_buffer, 4);
+      screenPrint(sprintf_P(char_buffer, PSTR("Advance %d%c%c"), slice_size, uom_chars[settingsValue[7]], uom_chars[1]), char_buffer, 4);
 
       if (stackCancelled()) break; // Exit early if the stack has been cancelled
 
